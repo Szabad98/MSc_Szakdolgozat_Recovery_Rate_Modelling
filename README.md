@@ -1,2 +1,1 @@
-# Msc-szakdoga
-Recovery rate modelling
+# MSc_Szakdolgozat_Recovery_Rate_Modelling
