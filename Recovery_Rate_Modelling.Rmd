@@ -1,0 +1,1704 @@
+---
+title: "Recovery rate modelling"
+author: "Szabadfalvi Dániel"
+date: '2022 05 03 '
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+# Első rész
+
+### Adatok kigyűjtése korrelációs modellezéshez
+Adatok: <https://www.bondora.com/hu/public-reports#shared-legend>
+```{r adatbazis}
+setwd("C:/Users/szaba/Desktop/Mester/4. szemeszter/Szakszem II/Data")
+LoanData <- read.csv("LoanData.csv")
+
+```
+
+
+### Adatok szűrése
+```{r adatok1}
+DefaultDate <- LoanData$DefaultDate
+EAD <- LoanData$EAD1 # csak ha volt default
+PD <- LoanData$ProbabilityOfDefault #egy éven belüli nemteljesítés valsége
+LGD <- LoanData$LossGivenDefault 
+RR <- 1-LGD
+Country <- LoanData$Country
+LoanDate <- LoanData$LoanDate
+MaturityDate_Original <- LoanData$MaturityDate_Original
+
+```
+
+
+### Negyedéves forma kialakítása
+```{r negyedeves bontas}
+library(zoo)
+Quarterly_Start <- as.yearqtr(LoanDate, format = "%Y-%m-%d")
+Quarterly_Default <- as.yearqtr(DefaultDate, format = "%Y-%m-%d") 
+Quarterly_End <- as.yearqtr(MaturityDate_Original, format = "%Y-%m-%d") 
+
+```
+
+
+### Alap adatbázis kialakítása
+```{r alapmodell}
+Model_10 <- data.frame(list(EAD,PD,LGD,RR,Country,LoanDate,DefaultDate,MaturityDate_Original,
+                            Quarterly_Start,Quarterly_Default,Quarterly_End))
+names(Model_10) <- c("EAD","PD","LGD","RR","Country","LoanDate","DefaultDate","MaturityDate_Original",
+                     "Quarterly_Start","Quarterly_Default","Quarterly_End")
+
+library(dplyr)
+#szűrés két szélére + szlovák adatok kiszűrése
+Model_11 <- Model_10 %>% filter(Quarterly_Start<2022,Quarterly_End>2016,PD>0)
+#szűrés hogy a defaultdate jó intervallumba essen
+Model_12 <- Model_11 %>% filter(DefaultDate<2022)
+Model_13 <- Model_12 %>% filter(Country!="SK")
+
+```
+
+
+### Negyedévente hány default van?
+```{r negyedévente hány defaultos}
+Default_darab <- Model_13 %>% filter(Quarterly_Default>=2016) %>% group_by(Quarterly_Default,Country) %>% summarise(default_db=n(),RR_atlag=mean(RR),RR_szoras=sd(RR))
+Default_darab <- rename(Default_darab,negyedev=Quarterly_Default)
+
+Default_db_eszt <- Default_darab %>% filter(Country=="EE")
+Default_db_spanyol <- Default_darab %>% filter(Country=="ES")
+Default_db_finn <- Default_darab %>% filter(Country=="FI")
+
+```
+
+
+### Negyedévente hány aktív hitel van?
+```{r negyedévente hány aktív hitel van}
+negyedevek <- Default_darab %>% filter(Country=="ES") #le kell szűrni ahhoz hogy meg lehessen számolni
+negyedevek <- negyedevek[["negyedev"]]
+
+Model_14 <- Model_13 %>% group_by(Country,Quarterly_Start,Quarterly_End,Quarterly_Default) %>% mutate(Zaras=min(Quarterly_End,Quarterly_Default))
+Model_14 <- Model_14 %>% select(Country,Quarterly_Start,Quarterly_End,Quarterly_Default,Zaras)
+
+Model_14$Zaras <- ifelse(is.na(Model_14$Zaras),Model_14$Quarterly_End,Model_14$Zaras) 
+Model_14$Zaras <- as.yearqtr(Model_14$Zaras)
+
+Egyedi_Eszt <- Model_14 %>% filter(Country=="EE")
+Egyedi_Spanyol <- Model_14 %>% filter(Country=="ES")
+Egyedi_Finn <- Model_14 %>% filter(Country=="FI")
+
+Hitel_db_eszt <- data.frame(matrix(NA,length(negyedevek),2))
+Hitel_db_spanyol <- data.frame(matrix(NA,length(negyedevek),2))
+Hitel_db_finn <- data.frame(matrix(NA,length(negyedevek),2))
+
+for (i in 1:length(negyedevek)) {
+  Hitel_db_eszt[i,1] <- sum(Egyedi_Eszt$Quarterly_Start <= negyedevek[i] & Egyedi_Eszt$Zaras >= negyedevek[i])
+  Hitel_db_spanyol[i,1] <- sum(Egyedi_Spanyol$Quarterly_Start <= negyedevek[i] & Egyedi_Spanyol$Zaras >= negyedevek[i])
+  Hitel_db_finn[i,1] <- sum(Egyedi_Finn$Quarterly_Start <= negyedevek[i] & Egyedi_Finn$Zaras >= negyedevek[i])
+  
+  Hitel_db_eszt[i,2] <- negyedevek[i]
+  Hitel_db_spanyol[i,2] <- negyedevek[i]
+  Hitel_db_finn[i,2] <- negyedevek[i]
+}
+names(Hitel_db_eszt) <- c("hitel_db","negyedev")
+names(Hitel_db_spanyol) <- c("hitel_db","negyedev")
+names(Hitel_db_finn) <- c("hitel_db","negyedev")
+
+Hitel_db_eszt$negyedev <- as.yearqtr(Hitel_db_eszt$negyedev)
+Hitel_db_spanyol$negyedev <- as.yearqtr(Hitel_db_spanyol$negyedev)
+Hitel_db_finn$negyedev <- as.yearqtr(Hitel_db_finn$negyedev)
+
+```
+
+
+### PD0 kiszámítása + transzformáció
+```{r PD0 számítás}
+#PD0 kiszámítása
+osszhitel_eszt <- nrow(Model_13 %>% filter(Country=="EE"))
+osszhitel_finn <- nrow(Model_13 %>% filter(Country=="FI"))
+osszhitel_spanyol <- nrow(Model_13 %>% filter(Country=="ES"))
+
+PD0_eszt <- sum(Default_db_eszt$default_db)/osszhitel_eszt
+PD0_finn <- sum(Default_db_finn$default_db)/osszhitel_finn
+PD0_spanyol <- sum(Default_db_spanyol$default_db)/osszhitel_spanyol
+
+PD_vector <- c(PD0_eszt,PD0_finn,PD0_spanyol)
+
+Long_term_PD0 <- data.frame(matrix(NA,3,2))
+colnames(Long_term_PD0) <- c("PD_0","y_D")
+rownames(Long_term_PD0) <- c("eszt","finn","spanyol")
+
+for (i in 1:3) {
+  Long_term_PD0[i,1] <- PD_vector[i]
+  Long_term_PD0[i,2] <- -1*qnorm(PD_vector[i])
+}
+```
+
+
+### Valós PD és átlagos RR értékek kiszámítása
+```{r negyedéves PD és RR adatok}
+PD_RR_valos_eszt <- merge(Default_db_eszt,Hitel_db_eszt,all = T)
+PD_RR_valos_eszt <- PD_RR_valos_eszt %>% mutate(PD_valos=default_db/hitel_db,LGD_atlag=1-RR_atlag) %>% select(negyedev,PD_valos,RR_atlag,LGD_atlag,Country)
+
+PD_RR_valos_spanyol <- merge(Default_db_spanyol,Hitel_db_spanyol,all = T)
+PD_RR_valos_spanyol <- PD_RR_valos_spanyol %>% mutate(PD_valos=default_db/hitel_db,LGD_atlag=1-RR_atlag) %>% select(negyedev,PD_valos,RR_atlag,LGD_atlag,Country)
+
+PD_RR_valos_finn <- merge(Default_db_finn,Hitel_db_finn,all =T)
+PD_RR_valos_finn <- PD_RR_valos_finn %>% mutate(PD_valos=default_db/hitel_db,LGD_atlag=1-RR_atlag) %>% select(negyedev,PD_valos,RR_atlag,LGD_atlag,Country)
+
+```
+
+
+### Negyedéves valós PD és átlagos RR ábrázolása
+```{r negyedéves PD és RR ábra}
+PD_RR_teljes <- bind_rows(PD_RR_valos_eszt,PD_RR_valos_spanyol,PD_RR_valos_finn)
+
+PD_RR_teljes[PD_RR_teljes=="EE"] <- "Észtország"
+PD_RR_teljes[PD_RR_teljes=="ES"] <- "Spanyolország"
+PD_RR_teljes[PD_RR_teljes=="FI"] <- "Finnország"
+
+library(ggplot2)
+library(scales)
+
+### Együtt ábrázolva: valós PD ###
+ggplot(PD_RR_teljes) +
+  aes(
+    x = negyedev,
+    y = PD_valos,
+    colour = Country,
+    group = Country
+  ) +
+  geom_step(size = 1) +
+  scale_fill_hue(direction = 1) +
+  scale_color_hue(direction = 1) +
+  labs(
+    x = "Negyedévek",
+    y = "Negyedéves empirikus PD értékek",
+    title = "A negyedéves empirikus PD értékek idősora országonként",
+    fill = "Ország",
+    color = "Ország"
+  ) +
+  ylim(0, 0.25) +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(size = 16L,
+    face = "bold",
+    hjust = 0.5),
+    axis.title.y = element_text(size = 12L),
+    axis.title.x = element_text(size = 12L),
+    legend.text = element_text(size = 12L)
+  ) +
+  scale_x_yearqtr(breaks = seq(from = min(PD_RR_teljes$negyedev), 
+                               to = max(PD_RR_teljes$negyedev), by = 1),
+                  format = "%YQ%q")
+
+## RR együtt
+ggplot(PD_RR_teljes) +
+  aes(
+    x = negyedev,
+    y = RR_atlag,
+    colour = Country,
+    group = Country
+  ) +
+  geom_step(size = 1) +
+  scale_fill_hue(direction = 1) +
+  scale_color_hue(direction = 1) +
+  labs(
+    x = "Negyedévek",
+    y = "Negyedéves átlagos RR értékek",
+    title = "A negyedéves átlagos RR értékek idősora országonként",
+    fill = "Ország",
+    color = "Ország"
+  ) +
+  ylim(0, 1) +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(size = 16L,
+    face = "bold",
+    hjust = 0.5),
+    axis.title.y = element_text(size = 12L),
+    axis.title.x = element_text(size = 12L),
+    legend.text = element_text(size = 12L)
+  ) +
+  scale_x_yearqtr(breaks = seq(from = min(PD_RR_teljes$negyedev), 
+                               to = max(PD_RR_teljes$negyedev), by = 1),
+                  format = "%YQ%q")
+
+```
+
+
+### Látens faktorok betöltése
+Látens faktorok:
+Harmonized Index of Consumer Prices (HICP): Harmonizált fogyasztói árindex Ezzel mérik az Európai Unióban az infláció mértékét (összetett mérőszám)
+Forrás: <https://ec.europa.eu/eurostat/web/main/data/database>
+```{r latens adatok}
+library(readxl)
+#GDP <- read_xlsx("GDP.xlsx", sheet="Adatok")
+GDP_per_capita <- read_xlsx("GDP_per_capita.xlsx", sheet="Adatok")
+#Unemployment <- read_xlsx("Unemployment.xlsx", sheet="Adatok2")
+Unemployment_rate <- read_xlsx("Unemployment_rate.xlsx", sheet="Adatok")
+HICP_inflation <- read_xlsx("HICP-inflation.xlsx", sheet="Adatok2")
+
+```
+
+
+### Speckó negyedéves időformátumba rendezés
+```{r latens időformátum alakítsa}
+#GDP$Quarterly <- as.yearqtr(GDP$TIME2,format="%Yq%q")
+GDP_per_capita$negyedev <- as.yearqtr(GDP_per_capita$TIME2,format="%Yq%q")
+Unemployment_rate$negyedev <- as.yearqtr(Unemployment_rate$TIME2,format="%Yq%q")
+
+```
+
+
+### Adatbázis feltöltése GDP/capita adatokkal
+```{r adatok1 + GDP}
+GDP_eszt <- GDP_per_capita %>% filter(Year>=2016) %>% select(negyedev, Estonia)
+GDP_eszt <- rename(GDP_eszt, GDP=Estonia)
+Adatok_eszt <- merge(x=PD_RR_valos_eszt, y=GDP_eszt,all=TRUE)
+
+GDP_spanyol <- GDP_per_capita %>% filter(Year>=2016) %>% select(negyedev, Spain)
+GDP_spanyol <- rename(GDP_spanyol, GDP=Spain)
+Adatok_spanyol <- merge(x=PD_RR_valos_spanyol, y=GDP_spanyol,all=TRUE)
+
+GDP_finn <- GDP_per_capita %>% filter(Year>=2016) %>% select(negyedev, Finland)
+GDP_finn <- rename(GDP_finn, GDP=Finland)
+Adatok_finn <- merge(x=PD_RR_valos_finn, y=GDP_finn,all=TRUE)
+
+```
+
+
+### Adatbázis felötlése Unemployment adatokkal
+```{r adatok1 + unempoyment}
+Unemployment_eszt <- Unemployment_rate %>% filter(Year>=2016) %>% select(negyedev, Estonia)
+Unemployment_eszt <- rename(Unemployment_eszt, Unemployment=Estonia)
+Adatok_eszt <- merge(x=Adatok_eszt, y=Unemployment_eszt, all=TRUE)
+
+Unemployment_spanyol <- Unemployment_rate %>% filter(Year>=2016) %>% select(negyedev, Spain)
+Unemployment_spanyol <- rename(Unemployment_spanyol, Unemployment=Spain)
+Adatok_spanyol <- merge(x=Adatok_spanyol, y=Unemployment_spanyol, all=TRUE)
+
+Unemployment_finn <- Unemployment_rate %>% filter(Year>=2016) %>% select(negyedev, Finland)
+Unemployment_finn <- rename(Unemployment_finn, Unemployment=Finland)
+Adatok_finn <- merge(x=Adatok_finn, y=Unemployment_finn, all=TRUE)
+
+```
+
+
+### Adatbázis feltöltése Inflation adatokkal
+```{r adatok1 + inflation}
+HICP_inflation <- HICP_inflation %>% filter(Quarterly!=0)
+HICP_inflation$negyedev <- as.yearqtr(HICP_inflation$Quarterly,format="%Yq%q")
+
+Inflation_eszt <- HICP_inflation %>% filter(Year>=2016) %>% select(negyedev, Estonia)
+Inflation_eszt <- rename(Inflation_eszt, Inflation=Estonia)
+Adatok_eszt <- merge(x=Adatok_eszt, y=Inflation_eszt, all=TRUE)
+
+Inflation_spanyol <- HICP_inflation %>% filter(Year>=2016) %>% select(negyedev, Spain)
+Inflation_spanyol <- rename(Inflation_spanyol, Inflation=Spain)
+Adatok_spanyol <- merge(x=Adatok_spanyol, y=Inflation_spanyol, all=TRUE)
+
+Inflation_finn <- HICP_inflation %>% filter(Year>=2016) %>% select(negyedev, Finland)
+Inflation_finn <- rename(Inflation_finn, Inflation=Finland)
+Adatok_finn <- merge(x=Adatok_finn, y=Inflation_finn, all=TRUE)
+
+```
+
+
+### Látens változók standardizálsa főfaktorelemzéshez (PCA)
+```{r adatok standardizálása}
+atlag1 <- mean(Adatok_eszt$GDP)
+atlag2 <- mean(Adatok_eszt$Unemployment)
+atlag3 <- mean(Adatok_eszt$Inflation)
+sd1 <- sd(Adatok_eszt$GDP)
+sd2 <- sd(Adatok_eszt$Unemployment)
+sd3 <- sd(Adatok_eszt$Inflation)
+Adatok_eszt <- Adatok_eszt %>% mutate(std_GDP=(GDP-atlag1)/sd1,std_unemp=(Unemployment-atlag2)/sd2,
+                                      std_infl=(Inflation-atlag3)/sd3)
+
+atlag1 <- mean(Adatok_spanyol$GDP)
+atlag2 <- mean(Adatok_spanyol$Unemployment)
+atlag3 <- mean(Adatok_spanyol$Inflation)
+sd1 <- sd(Adatok_spanyol$GDP)
+sd2 <- sd(Adatok_spanyol$Unemployment)
+sd3 <- sd(Adatok_spanyol$Inflation)
+Adatok_spanyol <- Adatok_spanyol %>% mutate(std_GDP=(GDP-atlag1)/sd1,std_unemp=(Unemployment-atlag2)/sd2,
+                                            std_infl=(Inflation-atlag3)/sd3)
+
+atlag1 <- mean(Adatok_finn$GDP)
+atlag2 <- mean(Adatok_finn$Unemployment)
+atlag3 <- mean(Adatok_finn$Inflation)
+sd1 <- sd(Adatok_finn$GDP)
+sd2 <- sd(Adatok_finn$Unemployment)
+sd3 <- sd(Adatok_finn$Inflation)
+Adatok_finn <- Adatok_finn %>% mutate(std_GDP=(GDP-atlag1)/sd1,std_unemp=(Unemployment-atlag2)/sd2,
+                                      std_infl=(Inflation-atlag3)/sd3)
+
+```
+
+
+### Főfaktorelemzés + x1 és x2 faktorok meghatározása
+```{r faktoranalízos}
+library(factoextra)
+
+#látens faktorokból két faktor készítése
+latens_eszt <- Adatok_eszt[,9:11]
+pca_eszt <- prcomp(latens_eszt,scale = T)
+fviz_eig(pca_eszt)
+get_eigenvalue(pca_eszt)
+seged_eszt <- data.frame(t(get_pca_var(pca_eszt)$coord))
+
+Adatok_eszt <- Adatok_eszt %>% mutate(PD_faktor=seged_eszt[1,1]*std_GDP+seged_eszt[1,2]*std_unemp+seged_eszt[1,3]*std_infl,
+                                      RR_faktor=seged_eszt[2,1]*std_GDP+seged_eszt[2,2]*std_unemp+seged_eszt[2,3]*std_infl)
+
+latens_finn <- Adatok_finn[,9:11]
+pca_finn <- prcomp(latens_finn,scale = T)
+fviz_eig(pca_finn)
+get_eigenvalue(pca_finn)
+seged_finn <- data.frame(t(get_pca_var(pca_finn)$coord))
+
+Adatok_finn <- Adatok_finn %>% mutate(PD_faktor=seged_finn[1,1]*std_GDP+seged_finn[1,2]*std_unemp+seged_finn[1,3]*std_infl,
+                                      RR_faktor=seged_finn[2,1]*std_GDP+seged_finn[2,2]*std_unemp+seged_finn[2,3]*std_infl)
+
+latens_spanyol <- Adatok_spanyol[,9:11]
+pca_spanyol <- prcomp(latens_spanyol,scale = T)
+fviz_eig(pca_spanyol)
+get_eigenvalue(pca_spanyol)
+seged_spanyol <- data.frame(t(get_pca_var(pca_spanyol)$coord))
+
+Adatok_spanyol <- Adatok_spanyol %>% mutate(PD_faktor=seged_spanyol[1,1]*std_GDP+seged_spanyol[1,2]*std_unemp+seged_spanyol[1,3]*std_infl,
+                                            RR_faktor=seged_spanyol[2,1]*std_GDP+seged_spanyol[2,2]*std_unemp+seged_spanyol[2,3]*std_infl)
+
+```
+
+
+### Összegző statisztikai táblázat I.
+```{r adatok1 summary}
+summary_eszt <- Adatok_eszt %>% select(
+  "Negyedéves valós PD" = PD_valos,
+  "Negyedéves átlagos RR" = RR_atlag,
+  "Egy főre jutó GDP" = GDP,
+  "Munkanélküliségi ráta" = Unemployment,
+  "Infláció - HICP" = Inflation,
+  "PD mögöttes faktora" = PD_faktor,
+  "RR mögöttes faktora" = RR_faktor
+) 
+
+summary_finn <- Adatok_finn %>% select(
+  "Negyedéves valós PD" = PD_valos,
+  "Negyedéves átlagos RR" = RR_atlag,
+  "Egy főre jutó GDP" = GDP,
+  "Munkanélküliségi ráta" = Unemployment,
+  "Infláció - HICP" = Inflation,
+  "PD mögöttes faktora" = PD_faktor,
+  "RR mögöttes faktora" = RR_faktor
+) 
+
+summary_spanyol <- Adatok_spanyol %>% select(
+  "Negyedéves valós PD" = PD_valos,
+  "Negyedéves átlagos RR" = RR_atlag,
+  "Egy főre jutó GDP" = GDP,
+  "Munkanélküliségi ráta" = Unemployment,
+  "Infláció - HICP" = Inflation,
+  "PD mögöttes faktora" = PD_faktor,
+  "RR mögöttes faktora" = RR_faktor
+) 
+
+summary(summary_eszt)
+summary(summary_finn)
+summary(summary_spanyol)
+
+sapply(summary_eszt, sd)
+sapply(summary_finn, sd)
+sapply(summary_spanyol, sd)
+
+```
+
+
+### Mögöttes faktorokra ARMA(p,q) modell illesztése
+```{r arma}
+library(forecast)
+library(tseries)
+
+# eszt adatok
+acf(Adatok_eszt$PD_faktor)
+pacf(Adatok_eszt$PD_faktor)
+auto.arima(Adatok_eszt$PD_faktor,max.d = 0, max.order = 10)
+
+arma_eszt_pd <- arima(Adatok_eszt$PD_faktor,order= c(1,0,0),include.mean=FALSE)
+beta_1_eszt <- 1
+checkresiduals(arma_eszt_pd)
+u_arma_eszt_pd <- as.numeric(residuals(arma_eszt_pd))
+
+acf(Adatok_eszt$RR_faktor)
+pacf(Adatok_eszt$RR_faktor)
+auto.arima(Adatok_eszt$RR_faktor,max.d = 0, max.order = 10)
+
+arma_eszt_rr <- arima(Adatok_eszt$RR_faktor,order= c(1,0,0),include.mean=FALSE)
+beta_2_eszt <- 1
+checkresiduals(arma_eszt_rr)
+u_arma_eszt_rr <- as.numeric(residuals(arma_eszt_rr))
+
+
+# finn adatok
+acf(Adatok_finn$PD_faktor)
+pacf(Adatok_finn$PD_faktor)
+auto.arima(Adatok_finn$PD_faktor,max.d = 0, max.order = 10)
+
+arma_finn_pd <- arima(Adatok_finn$PD_faktor,order= c(2,0,1),include.mean=FALSE)
+beta_1_finn <- sqrt(1-(arma_finn_pd$coef[3])^2)
+checkresiduals(arma_finn_pd)
+u_arma_finn_pd <- as.numeric(residuals(arma_finn_pd))
+
+acf(Adatok_finn$RR_faktor)
+pacf(Adatok_finn$RR_faktor)
+auto.arima(Adatok_finn$RR_faktor,max.d = 0, max.order = 10)
+
+arma_finn_rr <- arima(Adatok_finn$RR_faktor,order= c(1,0,0),include.mean=FALSE)
+beta_2_finn <- 1
+checkresiduals(arma_finn_rr)
+u_arma_finn_rr <- as.numeric(residuals(arma_finn_rr))
+
+
+#spanyol adatok
+acf(Adatok_spanyol$PD_faktor)
+pacf(Adatok_spanyol$PD_faktor)
+auto.arima(Adatok_spanyol$PD_faktor,max.d = 0, max.order = 10)
+
+arma_spanyol_pd <- arima(Adatok_spanyol$PD_faktor,order= c(2,0,1),include.mean=FALSE)
+beta_1_spanyol <- sqrt(1-(arma_spanyol_pd$coef[3])^2)
+checkresiduals(arma_spanyol_pd)
+u_arma_spanyol_pd <- as.numeric(residuals(arma_spanyol_pd))
+
+acf(Adatok_spanyol$RR_faktor)
+pacf(Adatok_spanyol$RR_faktor)
+auto.arima(Adatok_spanyol$RR_faktor,max.d = 0, max.order = 10)
+
+arma_spanyol_rr <- arima(Adatok_spanyol$RR_faktor,order= c(0,0,0),include.mean=FALSE)
+beta_2_spanyol <- 1
+checkresiduals(arma_spanyol_rr)
+u_arma_spanyol_rr <- as.numeric(residuals(arma_spanyol_rr))
+
+```
+
+
+### Eloszlás inverzének közelítése
+```{r inverz cdf}
+Model_15 <- Model_13 %>% filter(Quarterly_Default>=2016)
+
+#adatbázisok külön választása
+eszt_eloszlas <- Model_15 %>% filter(Country=="EE")
+finn_eloszlas <- Model_15 %>% filter(Country=="FI")
+spanyol_eloszlas <- Model_15 %>% filter(Country=="ES")
+
+# inverze értékei RR-re
+fun.ecdf <- ecdf(Model_15$RR)
+xxx <- fun.ecdf(sort(Model_15$RR))
+yyy <- sort(Model_15$RR)
+summary(lm(yyy~xxx))
+
+plot(x=xxx, y=yyy, main = "Teljes RR inverz")
+abline(a = 0.0857603,b = 0.9025874, col="green", lwd=3)
+
+
+#eszt
+fun.ecdf <- ecdf(eszt_eloszlas$RR)
+xxx <- fun.ecdf(sort(eszt_eloszlas$RR))
+yyy <- sort(eszt_eloszlas$RR)
+summary(lm(yyy~xxx))
+
+plot(x=xxx, y=yyy, main = "Észt RR inverz")
+abline(a = 0.1948296,b = 0.7508234, col="#F8766D", lwd=3)
+
+
+#finn
+fun.ecdf <- ecdf(finn_eloszlas$RR)
+xxx <- fun.ecdf(sort(finn_eloszlas$RR))
+yyy <- sort(finn_eloszlas$RR)
+summary(lm(yyy~xxx))
+
+plot(x=xxx, y=yyy, main = "Finn RR inverz")
+abline(a = -0.019935,b = 0.993332, col="#00BA38", lwd=3)
+
+
+#spanyol
+fun.ecdf <- ecdf(spanyol_eloszlas$RR)
+xxx <- fun.ecdf(sort(spanyol_eloszlas$RR))
+yyy <- sort(spanyol_eloszlas$RR)
+summary(lm(yyy~xxx))
+
+plot(x=xxx, y=yyy, main = "Spanyol RR inverz")
+abline(a = -0.0413000,b = 1.0284627, col="#619CFF", lwd=3)
+
+```
+
+
+### A kiválasztott inverz ggplot-ban való ábrázolása
+```{r kivalasztott inverz}
+fun.ecdf <- ecdf(eszt_eloszlas$RR)
+xxx <- fun.ecdf(sort(eszt_eloszlas$RR))
+yyy <- sort(eszt_eloszlas$RR)
+
+library(ggplot2)
+inverz <- data.frame(list(xxx,yyy))
+names(inverz) <- c("xxx","yyy")
+
+ggplot(inverz,aes(x=xxx,y=yyy)) + 
+  geom_point() +
+  geom_abline(intercept = 0.1948296, slope = 0.7508234, col="#F8766D", lwd=2) +
+  geom_line() + 
+  labs(
+    x = "Vigaszráta eloszlásfüggvényének értékei",
+    y = "Inverz értékei",
+    title = "A vigaszráta hosszútávú eloszlásfüggvényének inverze *",
+    caption = "* az észt adatok alapján"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14L,
+                              face = "bold",                          
+                              hjust = 0.5),
+    plot.caption = element_text(size = 10L,
+                                 face = "italic",                             
+                                 hjust = 1),
+    axis.title.y = element_text(size = 12L),
+    axis.title.x = element_text(size = 12L)
+  )
+
+```
+
+
+### Likelihood függvény meghatározása
+```{r likelihood függvény}
+
+likelihood <- function(u1,u2,x1,x2,beta1,beta2,y_D,omega,rho1,rho2,meredekseg){ 
+  # az likelihood mindig egyről induljon
+  lh = 1
+  for (i in 1:24) {
+    szamlalo1 = dnorm(u1[i])
+    nevezo1 = beta1 * sqrt(abs(rho1)/(1-abs(rho1))) * dnorm((sqrt(abs(rho1)) * x1[i] - y_D) / sqrt(1-rho1))
+    szamlalo2 =  dnorm(u2[i])
+    nevezo2 = sqrt(1-omega^2) * beta2 * sqrt(abs(rho2)) * meredekseg * (1/sqrt(2*pi)) *
+      exp((-1*rho2*((omega*x1[i]+sqrt(1-omega^2)*x2[i])^2))/(2*(2-rho2)))
+    
+    lh = lh * (szamlalo1/nevezo1) * (szamlalo2/nevezo2)
+  }
+  
+  lh
+} 
+
+```
+
+
+### MCMC szimuláció függvényének meghatározása
+```{r MCMC szim függvény}
+
+MCMC_fv <- function(u1,u2,x1,x2,beta1,beta2,y_D,omega_start,rho1_start,rho2_start,
+                    epszilon1,epszilon2,epszilon3,epszilon4,futas,pozitivitas,meredekseg){
+  
+  if (pozitivitas==TRUE) {
+    hatar1 <- 0
+    hatar2 <- 0
+    random_beta <- rbeta(futas,1,1)
+    random_beta2 <- 2*rbeta(futas,1,1)-1
+  } else {
+    hatar1 <- -1
+    hatar2 <- -2
+    random_beta <- 2*rbeta(futas,1,1)-1
+    random_beta2 <- 2*rbeta(futas,1,1)-1
+  }
+  
+  # Create an empty data.frame to store the accepted parameter values for each iteration.  
+  # Remember: "the posterior probability is just an updated version of the prior"  
+  posterior <- data.frame()  
+  
+  # Set the starting value of p  
+  omega <- omega_start
+  rho1 <- rho1_start
+  rho2 <- rho2_start
+   
+  # Start the loop (MCMC)  
+  for (i in 1:futas) {  
+    # Obtain a new proposal value for omega  
+    omega_prime <- omega + runif(1, -epszilon1,epszilon1)
+    # Avoid values out of the range -1 - 1  
+    if (omega_prime < -1) {
+      omega_prime <- -2 - omega_prime
+    }  
+    if (omega_prime > 1) {
+      omega_prime <- 2 - omega_prime
+    }
+    # Compute the acceptance probability using our likelihood function and the  
+    # beta(1,1) distribution as our prior probability.  
+    R1 <- likelihood(u1,u2,x1,x2,beta1,beta2,y_D,omega_prime,rho1,rho2,meredekseg) /
+      likelihood(u1,u2,x1,x2,beta1,beta2,y_D,omega,rho1,rho2,meredekseg) * 
+      dbeta((omega_prime+1)/2,1,1)/dbeta((omega+1)/2,1,1) 
+    # Accept or reject the new value of omega  
+    if (R1 > 1) {
+      R1 <- 1
+    }  
+    random1 <- runif (1,0,1)  
+    if (random1 < R1) {  
+      omega <- omega_prime  
+    }
+    # Store the likelihood of the accepted parameter and its value  
+    posterior[i,1] <- log(likelihood(u1,u2,x1,x2,beta1,beta2,y_D,omega,rho1,rho2,meredekseg))  
+    posterior[i,2] <- omega
+    
+    
+    # STEP2
+    # Obtain a new proposal value for rho1  
+    rho1_prime <- rho1 + runif(1, -epszilon2,epszilon2)
+    # Avoid values out of the range -1 - 1 
+    if (rho1_prime < hatar1) {
+      rho1_prime <- hatar2 - rho1_prime
+    }  
+    if (rho1_prime >= 1) {
+      rho1_prime <- 1.9999 - rho1_prime
+    }
+    # Compute the acceptance probability using our likelihood function and the  
+    # beta(1,1) distribution as our prior probability. 
+    R2 <- likelihood(u1,u2,x1,x2,beta1,beta2,y_D,omega,rho1_prime,rho2,meredekseg) /
+      likelihood(u1,u2,x1,x2,beta1,beta2,y_D,omega,rho1,rho2,meredekseg) * 
+      dbeta((rho1_prime+1)/2,1,1)/dbeta((rho1+1)/2,1,1)
+    # Accept or reject the new value of rho1  
+    if (R2 > 1) {
+      R2 <- 1
+    }  
+    random2 <- runif (1,0,1)  
+    if (random2 < R2) {  
+      rho1 <- rho1_prime 
+    }
+    # Store the likelihood of the accepted parameter and its value  
+    posterior[i,3] <- log(likelihood(u1,u2,x1,x2,beta1,beta2,y_D,omega,rho1,rho2,meredekseg))  
+    posterior[i,4] <- rho1
+    
+    
+    # STEP3
+    # Obtain a new proposal value for rho2  
+    rho2_prime <- rho2 + runif(1, -epszilon3,epszilon3)
+    # Avoid values out of the range -1 - 1 
+    if (rho2_prime < hatar1) {
+      rho2_prime <- hatar2 - rho2_prime
+    }  
+    if (rho2_prime >= 1) {
+      rho2_prime <- 1.9999 - rho2_prime
+    }
+    # Compute the acceptance probability using our likelihood function and the  
+    # beta(1,1) distribution as our prior probability. 
+    R3 <- likelihood(u1,u2,x1,x2,beta1,beta2,y_D,omega,rho1,rho2_prime,meredekseg) /
+      likelihood(u1,u2,x1,x2,beta1,beta2,y_D,omega,rho1,rho2,meredekseg) * 
+      dbeta((rho2_prime+1)/2,1,1)/dbeta((rho2+1)/2,1,1)
+    # Accept or reject the new value of rho2  
+    if (R3 > 1) {
+      R3 <- 1
+    }  
+    random3 <- runif (1,0,1)  
+    if (random3 < R3) {  
+      rho2 <- rho2_prime 
+    }
+    # Store the likelihood of the accepted parameter and its value  
+    posterior[i,5] <- log(likelihood(u1,u2,x1,x2,beta1,beta2,y_D,omega,rho1,rho2,meredekseg))  
+    posterior[i,6] <- rho2
+    
+    posterior[i,7] <- random_beta[i]
+    posterior[i,8] <- random_beta2[i]
+  } 
+  
+  # get the posterior df back  
+  posterior  
+}
+
+```
+
+
+### Ábrázoláshoz használt függvények meghatározása
+```{r MCMC ábrázol}
+library(ggplot2)
+library(patchwork)
+
+omega_abrazol <- function(eredmeny, hossz){
+  #omega
+  plot1 <- ggplot(eredmeny, aes(1:hossz, V2)) +
+    # geom_point()+
+    geom_line(lwd=1.5) +
+    geom_line(y=mean(eredmeny$V2), col="red",lwd=1.5)+
+    labs(
+      title = "omega értékének változása",
+      x = "szimuláció",
+      y = "omega"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 14L,face = "bold",hjust = 0.5),
+      axis.title.y = element_text(size = 12L,hjust = 0.5),
+      axis.title.x = element_text(size = 12L,hjust = 0.5)
+    ) 
+  
+  plot2 <- ggplot(eredmeny) +
+    geom_density(aes(V2),lwd=1.5, col="red",adjust=2.5) +
+    geom_density(aes(V8),lwd=1.5, col="blue",linetype="dotted",adjust=2) +
+    labs(
+      title = "prior vs posterior sűrűségfv.",
+      x = "omega",
+      y = "sűrűség"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 14L,face = "bold",hjust = 0.5),
+      axis.title.y = element_text(size = 12L,hjust = 0.5),
+      axis.title.x = element_text(size = 12L,hjust = 0.5)
+    ) +
+    xlim(min(min(eredmeny$V2),min((eredmeny$V7))), max(max(eredmeny$V2),max((eredmeny$V7))))
+    # xlim(-1,1)
+  
+  plot1+plot2
+}
+  
+  
+rho_1_abrazol <- function(eredmeny, hossz){
+  #rho1
+  plot3 <- ggplot(eredmeny, aes(1:hossz, V4)) +
+    # geom_point()+
+    geom_line(lwd=1.5) +
+    geom_line(y=mean(eredmeny$V4), col="red",lwd=1.5)+
+    labs(
+      title = "rho1 értékének változása",
+      x = "szimuláció",
+      y = "rho1"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 14L,face = "bold",hjust = 0.5),
+      axis.title.y = element_text(size = 12L,hjust = 0.5),
+      axis.title.x = element_text(size = 12L,hjust = 0.5)
+    ) 
+  
+  plot4 <- ggplot(eredmeny) +
+    geom_density(aes(V4),lwd=1.5, col="red",adjust=2.5) +
+    geom_density(aes(V7),lwd=1.5, col="blue",linetype="dotted",adjust=2) +
+    labs(
+      title = "prior vs posterior sűrűségfv.",
+      x = "rho1",
+      y = "sűrűség"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 14L,face = "bold",hjust = 0.5),
+      axis.title.y = element_text(size = 12L,hjust = 0.5),
+      axis.title.x = element_text(size = 12L,hjust = 0.5)
+    ) +
+    xlim(min(min(eredmeny$V4),min((eredmeny$V7))), max(max(eredmeny$V4),max((eredmeny$V7))))
+    # xlim(-1,1)
+  
+  plot3+plot4
+}
+
+rho_2_abrazol <- function(eredmeny, hossz){
+  #rho2
+  plot5 <- ggplot(eredmeny, aes(1:hossz, V6)) +
+    # geom_point()+
+    geom_line(lwd=1.5) +
+    geom_line(y=mean(eredmeny$V6), col="red",lwd=1.5)+
+    labs(
+      title = "rho2 értékének változása",
+      x = "szimuláció",
+      y = "rho2"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 14L,face = "bold",hjust = 0.5),
+      axis.title.y = element_text(size = 12L,hjust = 0.5),
+      axis.title.x = element_text(size = 12L,hjust = 0.5)
+    ) 
+  
+  plot6 <- ggplot(eredmeny) +
+    geom_density(aes(V6),lwd=1.5, col="red",adjust=2.5) +
+    geom_density(aes(V7),lwd=1.5, col="blue",linetype="dotted",adjust=2) +
+    labs(
+      title = "prior vs posterior sűrűségfv.",
+      x = "rho2",
+      y = "sűrűség"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 14L,face = "bold",hjust = 0.5),
+      axis.title.y = element_text(size = 12L,hjust = 0.5),
+      axis.title.x = element_text(size = 12L,hjust = 0.5)
+    ) +
+    xlim(min(min(eredmeny$V6),min((eredmeny$V7))), max(max(eredmeny$V6),max((eredmeny$V7))))
+    # xlim(-1,1)
+    
+  plot5+plot6
+}
+
+```
+
+
+### Észt adatokon MCMC szimuláció
+```{r MCMC_fv eszt}
+# a paraméterek: u1,u2,x1,x2,beta1,beta2,y_D,omega_start,rho1_start,rho2_start,e1,e2,e3,darabszám
+eredmeny_eszt <- MCMC_fv(u_arma_eszt_pd,u_arma_eszt_rr,Adatok_eszt$PD_faktor,
+                         Adatok_eszt$RR_faktor,beta_1_eszt,beta_2_eszt,Long_term_PD0[1,2],
+                         omega_start = -0.1,
+                         rho1_start = 0.2,
+                         rho2_start = 0.2,
+                         epszilon1 = 0.002,
+                         epszilon2 = 0.002,
+                         epszilon3 = 0.002,
+                         futas = 5000,
+                         pozitivitas = FALSE,
+                         meredekseg = 0.7508234)
+
+hossz <- nrow(eredmeny_eszt)
+
+omega_abrazol(eredmeny_eszt,hossz)
+rho_1_abrazol(eredmeny_eszt,hossz)
+rho_2_abrazol(eredmeny_eszt,hossz)
+
+```
+
+
+### Finn adatokon MCMC szimuláció
+```{r MCMC_fv finn}
+# a paraméterek: u1,u2,x1,x2,beta1,beta2,y_D,omega_start,rho1_start,rho2_start,e1,e2,e3,darabszám
+eredmeny_finn <- MCMC_fv(u_arma_finn_pd,u_arma_finn_rr,Adatok_finn$PD_faktor,
+                         Adatok_finn$RR_faktor,beta_1_finn,beta_2_finn,Long_term_PD0[2,2],
+                         omega_start = -0.1,
+                         rho1_start = 0.2,
+                         rho2_start = 0.2,
+                         epszilon1 = 0.002,
+                         epszilon2 = 0.002,
+                         epszilon3 = 0.002,
+                         futas = 5000,
+                         pozitivitas = FALSE,
+                         meredekseg = 0.7508234)
+
+hossz <- nrow(eredmeny_finn)
+
+omega_abrazol(eredmeny_finn,hossz)
+rho_1_abrazol(eredmeny_finn,hossz)
+rho_2_abrazol(eredmeny_finn,hossz)
+
+```
+
+
+### Spanyol adatokon MCMC szimuláció
+```{r MCMC_fv spanyol}
+# a paraméterek: u1,u2,x1,x2,beta1,beta2,y_D,omega_start,rho1_start,rho2_start,e1,e2,e3,darabszám
+eredmeny_spanyol <- MCMC_fv(u_arma_spanyol_pd,u_arma_spanyol_rr,Adatok_spanyol$PD_faktor,
+                            Adatok_spanyol$RR_faktor,beta_1_spanyol,beta_2_spanyol,Long_term_PD0[3,2],
+                            omega_start = -0.1,
+                            rho1_start = 0.2,
+                            rho2_start = 0.2,
+                            epszilon1 = 0.002,
+                            epszilon2 = 0.002,
+                            epszilon3 = 0.002,
+                            futas = 5000,
+                            pozitivitas = FALSE,
+                            meredekseg = 0.7508234)
+
+hossz <- nrow(eredmeny_spanyol)
+
+omega_abrazol(eredmeny_spanyol,hossz)
+rho_1_abrazol(eredmeny_spanyol,hossz)
+rho_2_abrazol(eredmeny_spanyol,hossz)
+
+```
+
+
+
+
+# Második rész
+
+### Adatok szűrése II.
+```{r adatok2}
+Age <- LoanData$Age
+Age <- data.frame(Age)
+
+Gender <- LoanData$Gender
+Gender_Sex <- data.frame(Gender) %>% mutate(D_woman=ifelse(Gender==1,1,0),
+                                            D_undef=ifelse(Gender==2,1,0))
+
+Education <- LoanData$Education
+Education <- data.frame(Education) %>% mutate(Education=ifelse(Education==-1|Education==0,1,Education))
+
+Total_Income <- LoanData$IncomeTotal
+Total_Income2 <- data.frame(Total_Income)
+MonthlyPayment <- LoanData$MonthlyPayment
+MonthlyPayment2 <- data.frame(MonthlyPayment)
+Debt_to_Income <- MonthlyPayment/Total_Income
+Debt_to_Income <- data.frame(Debt_to_Income)
+
+Homeownership <- LoanData$HomeOwnershipType
+Ingatlan <- data.frame(Homeownership) %>% mutate(D_berlo=ifelse(Homeownership==3|Homeownership==4|Homeownership==5|Homeownership==6,1,0)) 
+
+Occupation_Area <- LoanData$OccupationArea
+Munka <- data.frame(Occupation_Area) %>% mutate(D_irodai=ifelse(Occupation_Area==9|Occupation_Area==11|Occupation_Area==12|Occupation_Area==13|                                                  Occupation_Area==14|Occupation_Area==16|Occupation_Area==17|Occupation_Area==18,1,0),
+       D_egyeb_munka=ifelse(Occupation_Area==-1|Occupation_Area==0|Occupation_Area==1,1,0))
+
+# modellépítés
+Model_20 <- data.frame(list(Model_10,Age,Gender_Sex,Education,Total_Income2,MonthlyPayment2,Debt_to_Income,Ingatlan,Munka))
+
+# határ környezete
+epszilon <- 0.000001
+
+Model_21 <- Model_20 %>% filter(Quarterly_Start<2022,Quarterly_End>2016, Country!="SK",PD>0) %>% 
+            filter(DefaultDate<2022) %>% filter(Quarterly_Default>=2016) %>% 
+            filter(Homeownership>0) %>% 
+            filter(EAD>1) %>%
+            filter(MonthlyPayment>0) %>%
+            mutate(RR_szukitett=ifelse(RR==1,1-epszilon,RR),ln_RR=log(RR),RR_erteke="Valós")
+
+Model_22 <- na.omit(Model_21)
+
+regr_ESZT <- Model_22 %>% filter(Country=="EE")
+regr_SPANYOL <- Model_22 %>% filter(Country=="ES")
+
+# nincs undef nemű ügyfél
+regr_FINN <- Model_22 %>% filter(Country=="FI")
+
+#df-ek plotoláshoz => valós értékek
+teszt_regr_teljes <- Model_22 %>% select(RR,RR_erteke)
+teszt_regr_ESZT <- regr_ESZT %>% select(RR,RR_erteke)
+teszt_regr_SPANYOL <- regr_SPANYOL %>% select(RR,RR_erteke)
+teszt_regr_FINN <- regr_FINN %>% select(RR,RR_erteke)
+
+```
+
+
+### Valós adatok plotjai változókba helyezése, hogy minden módszernél könynen hozzáférhetőek legyenek
+```{r valós plotok}
+rplot_teljes <- ggplot(teszt_regr_teljes) +
+  aes(x = RR) +
+  geom_density(adjust=1,lwd=1.2, alpha = .6, fill = "grey70", colour = "grey70") +
+  scale_fill_hue(direction = 1) +
+  scale_color_hue(direction = 1) +
+  labs(
+    x = "Vigaszráta",
+    y = "Sűrűség"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title.y = element_text(size = 10L,hjust = 0.5),
+    axis.title.x = element_text(size = 10L,hjust = 0.5),
+    strip.text = element_text(size = 14L,face = "bold")
+  ) +
+  facet_wrap(vars(RR_erteke))+
+  xlim(0, 1)
+
+rplot_ESZT <- ggplot(teszt_regr_ESZT) +
+  aes(x = RR) +
+  geom_density(adjust=1,lwd=1.2, alpha = .6, fill = "#F8766D", colour = "#F8766D") +
+  scale_fill_hue(direction = 1) +
+  scale_color_hue(direction = 1) +
+  labs(
+    x = "Vigaszráta",
+    y = "Sűrűség"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title.y = element_text(size = 10L,hjust = 0.5),
+    axis.title.x = element_text(size = 10L,hjust = 0.5),
+    strip.text = element_text(size = 14L,face = "bold")
+  ) +
+  facet_wrap(vars(RR_erteke))+
+  xlim(0, 1)
+
+rplot_FINN <- ggplot(teszt_regr_FINN) +
+  aes(x = RR) +
+  geom_density(adjust=1,lwd=1.2, alpha = .6, fill = "#00BA38", colour = "#00BA38") +
+  scale_fill_hue(direction = 1) +
+  scale_color_hue(direction = 1) +
+  labs(
+    x = "Vigaszráta",
+    y = "Sűrűség"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title.y = element_text(size = 10L,hjust = 0.5),
+    axis.title.x = element_text(size = 10L,hjust = 0.5),
+    strip.text = element_text(size = 14L,face = "bold")
+  ) +
+  facet_wrap(vars(RR_erteke))+
+  xlim(0, 1)
+
+rplot_SPANYOL <-  ggplot(teszt_regr_SPANYOL) +
+  aes(x = RR) +
+  geom_density(adjust=1,lwd=1.2, alpha = .6, fill = "#619CFF", colour = "#619CFF") +
+  scale_fill_hue(direction = 1) +
+  scale_color_hue(direction = 1) +
+  labs(
+    x = "Vigaszráta",
+    y = "Sűrűség"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title.y = element_text(size = 10L,hjust = 0.5),
+    axis.title.x = element_text(size = 10L,hjust = 0.5),
+    strip.text = element_text(size = 14L,face = "bold")
+  ) +
+  facet_wrap(vars(RR_erteke))+
+  xlim(0, 1)
+
+```
+
+
+### Összegző statisztikai táblázat II.
+```{r adatok2 summary}
+summary_2_teljes <- Model_22 %>% select(
+  "Életkor" = Age,
+  "Rating PD" = PD,
+  "EAD" = EAD,
+  "Havi törlesztőrészlet" = MonthlyPayment,
+  "Adósság/jövedelem arány" = Debt_to_Income
+)
+
+summary_2_eszt <- regr_ESZT %>% select(
+  "Életkor" = Age,
+  "Rating PD" = PD,
+  "EAD" = EAD,
+  "Havi törlesztőrészlet" = MonthlyPayment,
+  "Adósság/jövedelem arány" = Debt_to_Income
+)
+
+summary_2_finn <- regr_FINN %>% select(
+  "Életkor" = Age,
+  "Rating PD" = PD,
+  "EAD" = EAD,
+  "Havi törlesztőrészlet" = MonthlyPayment,
+  "Adósság/jövedelem arány" = Debt_to_Income
+)
+
+summary_2_spanyol <- regr_SPANYOL %>% select(
+  "Életkor" = Age,
+  "Rating PD" = PD,
+  "EAD" = EAD,
+  "Havi törlesztőrészlet" = MonthlyPayment,
+  "Adósság/jövedelem arány" = Debt_to_Income
+)
+
+summary(summary_2_teljes)
+summary(summary_2_eszt)
+summary(summary_2_finn)
+summary(summary_2_spanyol)
+
+sapply(summary_2_teljes, sd)
+sapply(summary_2_eszt, sd)
+sapply(summary_2_finn, sd)
+sapply(summary_2_spanyol, sd)
+```
+
+
+### Egyszerűsített változószelekció (gyorsabban lefut, mint a forward vagy backward)
+```{r próba lineáris}
+# első regresszió változó szelekcióhoz
+kezdeti_regresszio <- lm(RR~PD+EAD+Total_Income+MonthlyPayment+Debt_to_Income+Age+D_woman+D_undef+D_irodai+D_egyeb_munka+Education,
+                         data=Model_22)
+
+summary(kezdeti_regresszio)
+# érdemes kihagyni az Total_income és a Education változókat
+
+```
+
+
+### Becslés lineáris regresszióval (OLS)
+```{r lineáris regresszió}
+teljes_lin_regr <- lm(RR~Debt_to_Income+PD+EAD+MonthlyPayment+Age+D_woman+D_undef+D_irodai+D_egyeb_munka,
+                      data=Model_22)
+
+eszt_lin_regr <- lm(RR~Debt_to_Income+PD+EAD+MonthlyPayment+Age+D_woman+D_undef+D_irodai+D_egyeb_munka,
+                    data=regr_ESZT)
+
+finn_lin_regr <- lm(RR~Debt_to_Income+PD+EAD+MonthlyPayment+Age+D_woman+D_irodai+D_egyeb_munka,
+                    data=regr_FINN)
+
+spanyol_lin_regr <- lm(RR~Debt_to_Income+PD+EAD+MonthlyPayment+Age+D_woman+D_undef+D_irodai+D_egyeb_munka,
+                       data=regr_SPANYOL)
+
+library(modelsummary)
+modelsummary(list(teljes_lin_regr,eszt_lin_regr,finn_lin_regr,spanyol_lin_regr))
+
+#becsült értékek kigyűjtése
+becsult_lin_regr_teljes <- data.frame(teljes_lin_regr$fitted.values) %>% mutate(RR_erteke="Becsült")
+becsult_lin_regr_teljes <- rename(becsult_lin_regr_teljes,RR=teljes_lin_regr.fitted.values)
+
+becsult_lin_regr_ESZT <- data.frame(eszt_lin_regr$fitted.values) %>% mutate(RR_erteke="Becsült")
+becsult_lin_regr_ESZT <- rename(becsult_lin_regr_ESZT,RR=eszt_lin_regr.fitted.values)
+
+becsult_lin_regr_FINN <- data.frame(finn_lin_regr$fitted.values) %>% mutate(RR_erteke="Becsült")
+becsult_lin_regr_FINN <- rename(becsult_lin_regr_FINN,RR=finn_lin_regr.fitted.values)
+
+becsult_lin_regr_SPANYOL <- data.frame(spanyol_lin_regr$fitted.values) %>% mutate(RR_erteke="Becsült")
+becsult_lin_regr_SPANYOL <- rename(becsult_lin_regr_SPANYOL,RR=spanyol_lin_regr.fitted.values)
+
+# df-ek plotoláshoz
+plot_lin_teljes <- bind_rows(becsult_lin_regr_teljes,teszt_regr_teljes)
+plot_lin_ESZT <- bind_rows(becsult_lin_regr_ESZT,teszt_regr_ESZT)
+plot_lin_FINN <- bind_rows(becsult_lin_regr_FINN,teszt_regr_FINN)
+plot_lin_SPANYOL <- bind_rows(becsult_lin_regr_SPANYOL,teszt_regr_SPANYOL)
+
+```
+
+
+### Ábrázolás: lineáris regressziós becslés + kernel density illesztés
+```{r plot lineáris regressszió}
+lin_plot_teljes <- ggplot(becsult_lin_regr_teljes) +
+  aes(x = RR) +
+  geom_density(adjust=1.5,lwd=1.2, alpha = .6, fill = "#FFDD00", colour = "#ECCD00") +
+  scale_fill_hue(direction = 1) +
+  scale_color_hue(direction = 1) +
+  labs(
+    x = "Vigaszráta",
+    y = "Sűrűség"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title.y = element_text(size = 10L,hjust = 0.5),
+    axis.title.x = element_text(size = 10L,hjust = 0.5),
+    strip.text = element_text(size = 14L,face = "bold")
+  ) +
+  facet_wrap(vars(RR_erteke))+
+  xlim(0, 1)
+
+lin_plot_ESZT <- ggplot(becsult_lin_regr_ESZT) +
+  aes(x = RR) +
+  geom_density(adjust=1.5,lwd=1.2, alpha = .6, fill = "#FFDD00", colour = "#ECCD00") +
+  scale_fill_hue(direction = 1) +
+  scale_color_hue(direction = 1) +
+  labs(
+    x = "Vigaszráta",
+    y = "Sűrűség"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title.y = element_text(size = 10L,hjust = 0.5),
+    axis.title.x = element_text(size = 10L,hjust = 0.5),
+    strip.text = element_text(size = 14L,face = "bold")
+  ) +
+  facet_wrap(vars(RR_erteke))+
+  xlim(0, 1)
+
+lin_plot_FINN <- ggplot(becsult_lin_regr_FINN) +
+  aes(x = RR) +
+  geom_density(adjust=1.5,lwd=1.2, alpha = .6, fill = "#FFDD00", colour = "#ECCD00") +
+  scale_fill_hue(direction = 1) +
+  scale_color_hue(direction = 1) +
+  labs(
+    x = "Vigaszráta",
+    y = "Sűrűség"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title.y = element_text(size = 10L,hjust = 0.5),
+    axis.title.x = element_text(size = 10L,hjust = 0.5),
+    strip.text = element_text(size = 14L,face = "bold")
+  ) +
+  facet_wrap(vars(RR_erteke))+
+  xlim(0, 1)
+
+lin_plot_SPANYOL <- ggplot(becsult_lin_regr_SPANYOL) +
+  aes(x = RR) +
+  geom_density(adjust=1.5,lwd=1.2, alpha = .6, fill = "#FFDD00", colour = "#ECCD00") +
+  scale_fill_hue(direction = 1) +
+  scale_color_hue(direction = 1) +
+  labs(
+    x = "Vigaszráta",
+    y = "Sűrűség"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title.y = element_text(size = 10L,hjust = 0.5),
+    axis.title.x = element_text(size = 10L,hjust = 0.5),
+    strip.text = element_text(size = 14L,face = "bold")
+  ) +
+  facet_wrap(vars(RR_erteke))+
+  xlim(0, 1)
+
+library(ggpubr)
+library(patchwork)
+ggarrange(rplot_teljes, lin_plot_teljes, nrow = 2) +
+  plot_annotation(
+    title = "A vigaszráta tapasztalati és becsült sűrűségfüggvénye",
+    subtitle = "Lineáris regresszió segítségével, a teljes adatbázis alapján", 
+    theme = theme(
+      plot.title = element_text(size = 16L,
+                                face = "bold",
+                                hjust = 0.5),
+      plot.subtitle = element_text(size = 13L,
+                                   face = "italic",
+                                   hjust = 0.5)
+      )
+  )
+
+ggarrange(rplot_ESZT,lin_plot_ESZT,nrow = 2) +
+  plot_annotation(
+    title = "A vigaszráta tapasztalati és becsült sűrűségfüggvénye",
+    subtitle = "Lineáris regresszió segítségével, az észt adatok alapján", 
+    theme = theme(
+      plot.title = element_text(size = 16L,
+                                face = "bold",
+                                hjust = 0.5),
+      plot.subtitle = element_text(size = 13L,
+                                   face = "italic",
+                                   hjust = 0.5)
+      )
+  )
+
+ggarrange(rplot_FINN,lin_plot_FINN,nrow = 2) +
+  plot_annotation(
+    title = "A vigaszráta tapasztalati és becsült sűrűségfüggvénye",
+    subtitle = "Lineáris regresszió segítségével, a finn adatok alapján", 
+    theme = theme(
+      plot.title = element_text(size = 16L,
+                                face = "bold",
+                                hjust = 0.5),
+      plot.subtitle = element_text(size = 13L,
+                                   face = "italic",
+                                   hjust = 0.5)
+      )
+  )
+
+ggarrange(rplot_SPANYOL,lin_plot_SPANYOL,nrow = 2) +
+  plot_annotation(
+    title = "A vigaszráta tapasztalati és becsült sűrűségfüggvénye",
+    subtitle = "Lineáris regresszió segítségével, a spanyol adatok alapján", 
+    theme = theme(
+      plot.title = element_text(size = 16L,
+                                face = "bold",
+                                hjust = 0.5),
+      plot.subtitle = element_text(size = 13L,
+                                   face = "italic",
+                                   hjust = 0.5)
+      )
+  )
+
+```
+
+
+### Becslés GLM regresszióval (IGR)
+```{r nemlineáris inverse gauss}
+teljes_inv_gauss_glm_regr <- glm(RR~Debt_to_Income+PD+EAD+MonthlyPayment+Age+D_woman+D_undef+D_irodai+D_egyeb_munka,
+                                 family = inverse.gaussian(link = "log"),
+                                 data=Model_22)
+
+eszt_inv_gauss_glm_regr <- glm(RR~Debt_to_Income+PD+EAD+MonthlyPayment+Age+D_woman+D_undef+D_irodai+D_egyeb_munka,
+                         family = inverse.gaussian(link = "log"),
+                         data=regr_ESZT)
+
+finn_inv_gauss_glm_regr <- glm(RR~Debt_to_Income+PD+EAD+MonthlyPayment+Age+D_woman+D_irodai+D_egyeb_munka,
+                         family = inverse.gaussian(link = "log"),
+                         data=regr_FINN)
+
+spanyol_inv_gauss_glm_regr <- glm(RR~Debt_to_Income+PD+EAD+MonthlyPayment+Age+D_woman+D_undef+D_irodai+D_egyeb_munka,
+                            family = inverse.gaussian(link = "log"),
+                            data=regr_SPANYOL)
+
+modelsummary(list(teljes_inv_gauss_glm_regr,eszt_inv_gauss_glm_regr,finn_inv_gauss_glm_regr,spanyol_inv_gauss_glm_regr))
+
+becsult_inv_gauss_glm_regr_teljes <- data.frame(teljes_inv_gauss_glm_regr$fitted.values) %>% mutate(RR_erteke="Becsült")
+becsult_inv_gauss_glm_regr_teljes <- rename(becsult_inv_gauss_glm_regr_teljes,RR=teljes_inv_gauss_glm_regr.fitted.values)
+
+becsult_inv_gauss_glm_regr_ESZT <- data.frame(eszt_inv_gauss_glm_regr$fitted.values) %>% mutate(RR_erteke="Becsült")
+becsult_inv_gauss_glm_regr_ESZT <- rename(becsult_inv_gauss_glm_regr_ESZT,RR=eszt_inv_gauss_glm_regr.fitted.values)
+
+becsult_inv_gauss_glm_regr_FINN <- data.frame(finn_inv_gauss_glm_regr$fitted.values) %>% mutate(RR_erteke="Becsült")
+becsult_inv_gauss_glm_regr_FINN <- rename(becsult_inv_gauss_glm_regr_FINN,RR=finn_inv_gauss_glm_regr.fitted.values)
+
+becsult_inv_gauss_glm_regr_SPANYOL <- data.frame(spanyol_inv_gauss_glm_regr$fitted.value) %>% mutate(RR_erteke="Becsült")
+becsult_inv_gauss_glm_regr_SPANYOL <- rename(becsult_inv_gauss_glm_regr_SPANYOL,RR=spanyol_inv_gauss_glm_regr.fitted.value)
+
+# df-ek plotoláshoz
+plot_inv_gauss_teljes <- bind_rows(becsult_inv_gauss_glm_regr_teljes,teszt_regr_teljes)
+plot_inv_gauss_ESZT <- bind_rows(becsult_inv_gauss_glm_regr_ESZT,teszt_regr_ESZT)
+plot_inv_gauss_FINN <- bind_rows(becsult_inv_gauss_glm_regr_FINN,teszt_regr_FINN)
+plot_inv_gauss_SPANYOL <- bind_rows(becsult_inv_gauss_glm_regr_SPANYOL,teszt_regr_SPANYOL)
+
+```
+
+
+### Ábrázolás: IG regressziós becslés + kernel density illesztés
+```{r plot inverse gauss}
+ivg_glm_plot_teljes <- ggplot(becsult_inv_gauss_glm_regr_teljes) +
+  aes(x = RR) +
+  geom_density(adjust=1.5,lwd=1.2, alpha = .6, fill = "#FFDD00", colour = "#ECCD00") +
+  scale_fill_hue(direction = 1) +
+  scale_color_hue(direction = 1) +
+  labs(
+    x = "Vigaszráta",
+    y = "Sűrűség"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title.y = element_text(size = 10L,hjust = 0.5),
+    axis.title.x = element_text(size = 10L,hjust = 0.5),
+    strip.text = element_text(size = 14L,face = "bold")
+  ) +
+  facet_wrap(vars(RR_erteke))+
+  xlim(0, 1)
+
+ivg_glm_plot_ESZT <- ggplot(becsult_inv_gauss_glm_regr_ESZT) +
+  aes(x = RR) +
+  geom_density(adjust=1.5,lwd=1.2, alpha = .6, fill = "#FFDD00", colour = "#ECCD00") +
+  scale_fill_hue(direction = 1) +
+  scale_color_hue(direction = 1) +
+  labs(
+    x = "Vigaszráta",
+    y = "Sűrűség"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title.y = element_text(size = 10L,hjust = 0.5),
+    axis.title.x = element_text(size = 10L,hjust = 0.5),
+    strip.text = element_text(size = 14L,face = "bold")
+  ) +
+  facet_wrap(vars(RR_erteke))+
+  xlim(0, 1)
+
+ivg_glm_plot_FINN <- ggplot(becsult_inv_gauss_glm_regr_FINN) +
+  aes(x = RR) +
+  geom_density(adjust=1.5,lwd=1.2, alpha = .6, fill = "#FFDD00", colour = "#ECCD00") +
+  scale_fill_hue(direction = 1) +
+  scale_color_hue(direction = 1) +
+  labs(
+    x = "Vigaszráta",
+    y = "Sűrűség"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title.y = element_text(size = 10L,hjust = 0.5),
+    axis.title.x = element_text(size = 10L,hjust = 0.5),
+    strip.text = element_text(size = 14L,face = "bold")
+  ) +
+  facet_wrap(vars(RR_erteke))+
+  xlim(0, 1)
+
+ivg_glm_plot_SPANYOL <- ggplot(becsult_inv_gauss_glm_regr_SPANYOL) +
+  aes(x = RR) +
+  geom_density(adjust=1.5,lwd=1.2, alpha = .6, fill = "#FFDD00", colour = "#ECCD00") +
+  scale_fill_hue(direction = 1) +
+  scale_color_hue(direction = 1) +
+  labs(
+    x = "Vigaszráta",
+    y = "Sűrűség"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title.y = element_text(size = 10L,hjust = 0.5),
+    axis.title.x = element_text(size = 10L,hjust = 0.5),
+    strip.text = element_text(size = 14L,face = "bold")
+  ) +
+  facet_wrap(vars(RR_erteke))+
+  xlim(0, 1)
+
+ggarrange(rplot_teljes, ivg_glm_plot_teljes, nrow = 2) +
+  plot_annotation(
+    title = "A vigaszráta tapasztalati és becsült sűrűségfüggvénye",
+    subtitle = "Inverz Gauss regresszió segítségével, a teljes adatbázis alapján", 
+    theme = theme(
+      plot.title = element_text(size = 16L,
+                                face = "bold",
+                                hjust = 0.5),
+      plot.subtitle = element_text(size = 13L,
+                                   face = "italic",
+                                   hjust = 0.5)
+      )
+  )
+
+ggarrange(rplot_ESZT,ivg_glm_plot_ESZT,nrow = 2) +
+  plot_annotation(
+    title = "A vigaszráta tapasztalati és becsült sűrűségfüggvénye",
+    subtitle = "Inverz Gauss regresszió segítségével, az észt adatok alapján", 
+    theme = theme(
+      plot.title = element_text(size = 16L,
+                                face = "bold",
+                                hjust = 0.5),
+      plot.subtitle = element_text(size = 13L,
+                                   face = "italic",
+                                   hjust = 0.5)
+      )
+  )
+
+ggarrange(rplot_FINN,ivg_glm_plot_FINN,nrow = 2) +
+  plot_annotation(
+    title = "A vigaszráta tapasztalati és becsült sűrűségfüggvénye",
+    subtitle = "Inverz Gauss regresszió segítségével, a finn adatok alapján", 
+    theme = theme(
+      plot.title = element_text(size = 16L,
+                                face = "bold",
+                                hjust = 0.5),
+      plot.subtitle = element_text(size = 13L,
+                                   face = "italic",
+                                   hjust = 0.5)
+      )
+  )
+
+ggarrange(rplot_SPANYOL,ivg_glm_plot_SPANYOL,nrow = 2) +
+  plot_annotation(
+    title = "A vigaszráta tapasztalati és becsült sűrűségfüggvénye",
+    subtitle = "Inverz Gauss regresszió segítségével, a spanyol adatok alapján", 
+    theme = theme(
+      plot.title = element_text(size = 16L,
+                                face = "bold",
+                                hjust = 0.5),
+      plot.subtitle = element_text(size = 13L,
+                                   face = "italic",
+                                   hjust = 0.5)
+      )
+  )
+```
+
+
+### Becslés béta regresszióval
+```{r béta regresszió}
+library(betareg)
+teljes_beta_regr <- betareg(RR_szukitett~Debt_to_Income+PD+EAD+MonthlyPayment+Age+D_woman+D_undef+D_irodai+D_egyeb_munka,
+                            data=Model_22, link = "cloglog")
+
+eszt_beta_regr <- betareg(RR_szukitett~Debt_to_Income+PD+EAD+MonthlyPayment+Age+D_woman+D_undef+D_irodai+D_egyeb_munka,
+                          data=regr_ESZT, link = "cloglog")
+
+finn_beta_regr <- betareg(RR_szukitett~Debt_to_Income+PD+EAD+MonthlyPayment+Age+D_woman+D_irodai+D_egyeb_munka,
+                          data=regr_FINN, link = "cloglog")
+
+spanyol_beta_regr <- betareg(RR_szukitett~Debt_to_Income+PD+EAD+MonthlyPayment+Age+D_woman+D_undef+D_irodai+D_egyeb_munka,
+                             data=regr_SPANYOL, link = "cloglog")
+ 
+# nem fut le mert a betaregresszió outputja túl nagy és kezelhetetlen
+# modelsummary(list(teljes_beta_regr,eszt_beta_regr,finn_beta_regr,spanyol_beta_regr)) 
+
+#becsült értékek kigyűjtése
+becsult_beta_regr_teljes <- data.frame(teljes_beta_regr$fitted.values) %>% mutate(RR_erteke="Becsült")
+becsult_beta_regr_teljes <- rename(becsult_beta_regr_teljes,RR=teljes_beta_regr.fitted.values)
+
+becsult_beta_regr_ESZT <- data.frame(eszt_beta_regr$fitted.values) %>% mutate(RR_erteke="Becsült")
+becsult_beta_regr_ESZT <- rename(becsult_beta_regr_ESZT,RR=eszt_beta_regr.fitted.values)
+
+becsult_beta_regr_FINN <- data.frame(finn_beta_regr$fitted.values) %>% mutate(RR_erteke="Becsült")
+becsult_beta_regr_FINN <- rename(becsult_beta_regr_FINN,RR=finn_beta_regr.fitted.values)
+
+becsult_beta_regr_SPANYOL <- data.frame(spanyol_beta_regr$fitted.values) %>% mutate(RR_erteke="Becsült")
+becsult_beta_regr_SPANYOL <- rename(becsult_beta_regr_SPANYOL,RR=spanyol_beta_regr.fitted.values)
+
+# df-ek plotoláshoz
+plot_beta_teljes <- bind_rows(becsult_beta_regr_teljes,teszt_regr_teljes)
+plot_beta_ESZT <- bind_rows(becsult_beta_regr_ESZT,teszt_regr_ESZT)
+plot_beta_FINN <- bind_rows(becsult_beta_regr_FINN,teszt_regr_FINN)
+plot_beta_SPANYOL <- bind_rows(becsult_beta_regr_SPANYOL,teszt_regr_SPANYOL)
+
+```
+
+
+### Ábrázolás: béta regressziós becslés + kernel density illesztés
+```{r plot béta regresszió}
+beta_plot_teljes <- ggplot(becsult_beta_regr_teljes) +
+  aes(x = RR) +
+  geom_density(adjust=1.5,lwd=1.2, alpha = .6, fill = "#FFDD00", colour = "#ECCD00") +
+  scale_fill_hue(direction = 1) +
+  scale_color_hue(direction = 1) +
+  labs(
+    x = "Vigaszráta",
+    y = "Sűrűség"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title.y = element_text(size = 10L,hjust = 0.5),
+    axis.title.x = element_text(size = 10L,hjust = 0.5),
+    strip.text = element_text(size = 14L,face = "bold")
+  ) +
+  facet_wrap(vars(RR_erteke))+
+  xlim(0, 1)
+
+beta_plot_ESZT <- ggplot(becsult_beta_regr_ESZT) +
+  aes(x = RR) +
+  geom_density(adjust=1.5,lwd=1.2, alpha = .6, fill = "#FFDD00", colour = "#ECCD00") +
+  scale_fill_hue(direction = 1) +
+  scale_color_hue(direction = 1) +
+  labs(
+    x = "Vigaszráta",
+    y = "Sűrűség"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title.y = element_text(size = 10L,hjust = 0.5),
+    axis.title.x = element_text(size = 10L,hjust = 0.5),
+    strip.text = element_text(size = 14L,face = "bold")
+  ) +
+  facet_wrap(vars(RR_erteke))+
+  xlim(0, 1)
+
+beta_plot_FINN <- ggplot(becsult_beta_regr_FINN) +
+  aes(x = RR) +
+  geom_density(adjust=1.5,lwd=1.2, alpha = .6, fill = "#FFDD00", colour = "#ECCD00") +
+  scale_fill_hue(direction = 1) +
+  scale_color_hue(direction = 1) +
+  labs(
+    x = "Vigaszráta",
+    y = "Sűrűség"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title.y = element_text(size = 10L,hjust = 0.5),
+    axis.title.x = element_text(size = 10L,hjust = 0.5),
+    strip.text = element_text(size = 14L,face = "bold")
+  ) +
+  facet_wrap(vars(RR_erteke))+
+  xlim(0, 1)
+
+beta_plot_SPANYOL <- ggplot(becsult_beta_regr_SPANYOL) +
+  aes(x = RR) +
+  geom_density(adjust=1.5,lwd=1.2, alpha = .6, fill = "#FFDD00", colour = "#ECCD00") +
+  scale_fill_hue(direction = 1) +
+  scale_color_hue(direction = 1) +
+  labs(
+    x = "Vigaszráta",
+    y = "Sűrűség"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title.y = element_text(size = 10L,hjust = 0.5),
+    axis.title.x = element_text(size = 10L,hjust = 0.5),
+    strip.text = element_text(size = 14L,face = "bold")
+  ) +
+  facet_wrap(vars(RR_erteke))+
+  xlim(0, 1)
+
+# beta_plot_teljes
+# beta_plot_ESZT
+# beta_plot_FINN
+# beta_plot_SPANYOL
+
+ggarrange(rplot_teljes, beta_plot_teljes, nrow = 2) +
+  plot_annotation(
+    title = "A vigaszráta tapasztalati és becsült sűrűségfüggvénye",
+    subtitle = "Béta (eloszlás) regresszió segítségével, a teljes adatbázis alapján", 
+    theme = theme(
+      plot.title = element_text(size = 16L,
+                                face = "bold",
+                                hjust = 0.5),
+      plot.subtitle = element_text(size = 13L,
+                                   face = "italic",
+                                   hjust = 0.5)
+      )
+  )
+
+ggarrange(rplot_ESZT,beta_plot_ESZT,nrow = 2) +
+  plot_annotation(
+    title = "A vigaszráta tapasztalati és becsült sűrűségfüggvénye",
+    subtitle = "Béta (eloszlás) regresszió segítségével, az észt adatok alapján", 
+    theme = theme(
+      plot.title = element_text(size = 16L,
+                                face = "bold",
+                                hjust = 0.5),
+      plot.subtitle = element_text(size = 13L,
+                                   face = "italic",
+                                   hjust = 0.5)
+      )
+  )
+
+ggarrange(rplot_FINN,beta_plot_FINN,nrow = 2) +
+  plot_annotation(
+    title = "A vigaszráta tapasztalati és becsült sűrűségfüggvénye",
+    subtitle = "Béta (eloszlás) regresszió segítségével, a finn adatok alapján", 
+    theme = theme(
+      plot.title = element_text(size = 16L,
+                                face = "bold",
+                                hjust = 0.5),
+      plot.subtitle = element_text(size = 13L,
+                                   face = "italic",
+                                   hjust = 0.5)
+      )
+  )
+
+ggarrange(rplot_SPANYOL,beta_plot_SPANYOL,nrow = 2) +
+  plot_annotation(
+    title = "A vigaszráta tapasztalati és becsült sűrűségfüggvénye",
+    subtitle = "Béta (eloszlás) regresszió segítségével, a spanyol adatok alapján", 
+    theme = theme(
+      plot.title = element_text(size = 16L,
+                                face = "bold",
+                                hjust = 0.5),
+      plot.subtitle = element_text(size = 13L,
+                                   face = "italic",
+                                   hjust = 0.5)
+      )
+  )
+
+```
+
+
+### valós eloszlások bemutása
+```{r plot valós adatok végül}
+Model_23 <- Model_22
+Model_23[Model_23=="EE"] <- "Észtország"
+Model_23[Model_23=="ES"] <- "Spanyolország"
+Model_23[Model_23=="FI"] <- "Finnország"
+
+veg_teljes <- Model_23 %>% mutate(Country="A teljes adatbázis")
+veg_fullos <- bind_rows(Model_23, veg_teljes)
+
+# egymás mellett a három ország és a teljes
+rr_osszetett2 <- ggplot(veg_fullos) +
+  aes(x = RR, fill = Country, colour = Country) +
+  geom_density(adjust = 1,lwd=.9,alpha=.6) +
+  labs(
+    x = "Vigaszráta",
+    y = "Sűrűség",
+    title = "A vigaszráta tapasztalati sűrűségfüggvénye az egyes esetekben",
+    fill = "Ország:",
+    color = "Ország:"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(size = 16L,
+    face = "bold",
+    hjust = 0.5),
+    axis.title.y = element_text(size = 12L),
+    axis.title.x = element_text(size = 12L),
+    strip.text.x = element_text(size = 13L),
+    legend.text = element_text(size = 11L)
+  ) +
+  facet_wrap(
+    vars(Country),
+    scales = "free_y",
+    ncol = 2L,
+    nrow = 2L
+  ) +
+  xlim(0, 1)
+
+rr_osszetett2+
+  scale_color_manual(values = c("grey70","#F8766D", "#00BA38", "#619CFF")) +
+  scale_fill_manual(values =  c("grey70","#F8766D", "#00BA38", "#619CFF"))
+
+
+#egymáson a három ország
+ggplot(Model_23) +
+  aes(x = RR, fill = Country, colour = Country) +
+  geom_density(adjust = 1,lwd=1, alpha = .5) +
+  scale_fill_hue(direction = 1) +
+  scale_color_hue(direction = 1) +
+  labs(
+    x = "Vigaszráta",
+    y = "Sűrűség",
+    title = "A vigaszráta tapasztalati sűrűségfüggvénye országonként",
+    fill = "Ország:", 
+    color = "Ország:"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(size = 16L,
+    face = "bold",                          
+    hjust = 0.5),
+    axis.title.y = element_text(size = 12L),
+    axis.title.x = element_text(size = 12L),
+    legend.text = element_text(size = 11L)
+  ) +
+  theme(legend.position = "top") +
+  xlim(0, 1)
+
+
+```
+
